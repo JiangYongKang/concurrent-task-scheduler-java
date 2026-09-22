@@ -37,3 +37,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### 本地调度器运行数据（WAL） ###
+/data/
+/target/test-data/
