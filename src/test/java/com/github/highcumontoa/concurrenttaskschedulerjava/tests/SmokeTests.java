@@ -1,6 +1,7 @@
 package com.github.highcumontoa.concurrenttaskschedulerjava.tests;
 
 import com.github.highcumontoa.concurrenttaskschedulerjava.config.SchedulerProperties;
+import com.github.highcumontoa.concurrenttaskschedulerjava.governance.FileGovernanceStore;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.DefaultHandlerRegistry;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.SampleTaskHandler;
 import com.github.highcumontoa.concurrenttaskschedulerjava.model.TaskStatus;
@@ -22,13 +23,17 @@ class SmokeTests {
     void singleTaskSucceeds(@TempDir Path dir) {
         SchedulerProperties props = new SchedulerProperties();
         props.setWalFile(dir.resolve("smoke.wal").toString());
+        props.setGovernanceFile(dir.resolve("smoke.governance.jsonl").toString());
         props.setWalFsync(false);
         props.setWorkerThreads(2);
         WalTaskStore store = new WalTaskStore(props.getWalFile(), false);
+        FileGovernanceStore governanceStore =
+                new FileGovernanceStore(props.getGovernanceFile(), false);
         QuotaManager qm = new QuotaManager();
         DefaultHandlerRegistry registry = new DefaultHandlerRegistry();
         registry.register(new SampleTaskHandler());
-        TaskSchedulerService service = new TaskSchedulerService(store, qm, registry, props);
+        TaskSchedulerService service =
+                new TaskSchedulerService(store, governanceStore, qm, registry, props);
         service.start();
         try {
             service.submit("t1", "alice", "default", "sample", "hello", null);
@@ -38,6 +43,7 @@ class SmokeTests {
         } finally {
             service.shutdown();
             store.close();
+            governanceStore.close();
         }
     }
 }

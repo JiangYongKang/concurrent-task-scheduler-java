@@ -35,6 +35,11 @@ public class SchedulerProperties {
     private String walFile = "data/task-scheduler.wal";
     /** 每次写 WAL 是否 fsync（测试关盘可关闭）。 */
     private boolean walFsync = true;
+    /**
+     * 运行期治理事件日志路径（配额调整 / 暂停 / 恢复）。
+     * 为空时默认在 WAL 文件同目录追加 {@code .governance.jsonl}。
+     */
+    private String governanceFile = "";
     /** 按 caller 或 caller:group 覆盖配额。 */
     private Map<String, QuotaOverride> quotas = new LinkedHashMap<>();
 
@@ -75,6 +80,8 @@ public class SchedulerProperties {
     public void setWalFile(String walFile) { this.walFile = walFile; }
     public boolean isWalFsync() { return walFsync; }
     public void setWalFsync(boolean walFsync) { this.walFsync = walFsync; }
+    public String getGovernanceFile() { return governanceFile; }
+    public void setGovernanceFile(String governanceFile) { this.governanceFile = governanceFile; }
     public Map<String, QuotaOverride> getQuotas() { return quotas; }
     public void setQuotas(Map<String, QuotaOverride> quotas) { this.quotas = quotas; }
 }

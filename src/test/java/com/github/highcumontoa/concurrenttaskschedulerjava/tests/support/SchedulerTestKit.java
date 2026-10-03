@@ -1,6 +1,8 @@
 package com.github.highcumontoa.concurrenttaskschedulerjava.tests.support;
 
 import com.github.highcumontoa.concurrenttaskschedulerjava.config.SchedulerProperties;
+import com.github.highcumontoa.concurrenttaskschedulerjava.governance.FileGovernanceStore;
+import com.github.highcumontoa.concurrenttaskschedulerjava.governance.GovernanceStore;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.DefaultHandlerRegistry;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.SampleTaskHandler;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.TaskHandler;
@@ -19,6 +21,7 @@ public final class SchedulerTestKit implements AutoCloseable {
 
     public final SchedulerProperties props;
     public WalTaskStore store;
+    public GovernanceStore governanceStore;
     public QuotaManager quotaManager;
     public DefaultHandlerRegistry registry;
     public TaskSchedulerService service;
@@ -36,20 +39,28 @@ public final class SchedulerTestKit implements AutoCloseable {
     private void boot(boolean fresh) {
         if (!fresh) {
             store = new WalTaskStore(props.getWalFile(), false);
+            governanceStore = new FileGovernanceStore(props.getGovernanceFile(), false);
         }
         quotaManager = new QuotaManager();
         quotaManager.setDefaultLimits(new QuotaLimits(props.getDefaultMaxConcurrency(),
                 props.getDefaultRateLimitPerSecond(), props.getDefaultMaxQueued()));
         registry = new DefaultHandlerRegistry();
         handlerFactories.forEach(f -> registry.register(f.get()));
-        service = new TaskSchedulerService(store, quotaManager, registry, props);
+        service = new TaskSchedulerService(store, governanceStore, quotaManager, registry, props);
         service.start();
     }
 
-    /** 关闭当前实例并用同一 WAL 重建（模拟进程重启）。 */
+    /** 关闭当前实例并用同一 WAL + 治理日志重建（模拟进程重启）。 */
     public SchedulerTestKit restart() {
         service.shutdown();
         store.close();
+        if (governanceStore instanceof AutoCloseable c) {
+            try {
+                c.close();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
         SchedulerTestKit kit = new SchedulerTestKit(props);
         kit.handlerFactories.addAll(this.handlerFactories);
         kit.boot(false);
@@ -64,6 +75,13 @@ public final class SchedulerTestKit implements AutoCloseable {
         closed = true;
         service.shutdown();
         store.close();
+        if (governanceStore instanceof AutoCloseable c) {
+            try {
+                c.close();
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
     }
 
     public static final class Builder {
@@ -97,6 +115,7 @@ public final class SchedulerTestKit implements AutoCloseable {
         public SchedulerTestKit build() {
             SchedulerProperties props = new SchedulerProperties();
             props.setWalFile(walDir.resolve("scheduler.wal").toString());
+            props.setGovernanceFile(walDir.resolve("scheduler.governance.jsonl").toString());
             props.setWalFsync(false);
             props.setWorkerThreads(workers);
             props.setDefaultMaxConcurrency(maxConcurrency);
@@ -111,6 +130,7 @@ public final class SchedulerTestKit implements AutoCloseable {
             SchedulerTestKit kit = new SchedulerTestKit(props);
             kit.handlerFactories.addAll(factories);
             kit.store = new WalTaskStore(props.getWalFile(), false);
+            kit.governanceStore = new FileGovernanceStore(props.getGovernanceFile(), false);
             kit.boot(true);
             return kit;
         }

@@ -2,6 +2,8 @@ package com.github.highcumontoa.concurrenttaskschedulerjava.config;
 
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.DefaultHandlerRegistry;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.HandlerRegistry;
+import com.github.highcumontoa.concurrenttaskschedulerjava.governance.FileGovernanceStore;
+import com.github.highcumontoa.concurrenttaskschedulerjava.governance.GovernanceStore;
 import com.github.highcumontoa.concurrenttaskschedulerjava.quota.QuotaKey;
 import com.github.highcumontoa.concurrenttaskschedulerjava.quota.QuotaLimits;
 import com.github.highcumontoa.concurrenttaskschedulerjava.quota.QuotaManager;
@@ -20,6 +22,26 @@ public class SchedulerConfiguration {
     @Bean
     public TaskStore taskStore(SchedulerProperties props) {
         return new WalTaskStore(props.getWalFile(), props.isWalFsync());
+    }
+
+    /** 运行期治理事件日志（配额调整 / 暂停 / 恢复），独立于任务 WAL。 */
+    @Bean
+    public GovernanceStore governanceStore(SchedulerProperties props) {
+        return new FileGovernanceStore(resolveGovernanceFile(props), props.isWalFsync());
+    }
+
+    /** 治理日志路径：未配置时取 WAL 同目录下 {@code <walName>.governance.jsonl}。 */
+    static String resolveGovernanceFile(SchedulerProperties props) {
+        String configured = props.getGovernanceFile();
+        if (configured != null && !configured.isBlank()) {
+            return configured;
+        }
+        java.nio.file.Path wal = java.nio.file.Paths.get(props.getWalFile());
+        java.nio.file.Path parent = wal.toAbsolutePath().getParent();
+        String fileName = (wal.getFileName() == null ? "task-scheduler.wal"
+                : wal.getFileName().toString()) + ".governance.jsonl";
+        return (parent == null ? java.nio.file.Paths.get(fileName)
+                : parent.resolve(fileName)).toString();
     }
 
     @Bean
@@ -57,9 +79,12 @@ public class SchedulerConfiguration {
     }
 
     @Bean
-    public TaskSchedulerService taskSchedulerService(TaskStore store, QuotaManager quotaManager,
+    public TaskSchedulerService taskSchedulerService(TaskStore store,
+                                                     GovernanceStore governanceStore,
+                                                     QuotaManager quotaManager,
                                                      HandlerRegistry handlerRegistry,
                                                      SchedulerProperties props) {
-        return new TaskSchedulerService(store, quotaManager, handlerRegistry, props);
+        return new TaskSchedulerService(store, governanceStore, quotaManager, handlerRegistry,
+                props);
     }
 }
