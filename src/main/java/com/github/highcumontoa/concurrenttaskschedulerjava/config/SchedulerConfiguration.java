@@ -1,5 +1,6 @@
 package com.github.highcumontoa.concurrenttaskschedulerjava.config;
 
+import com.github.highcumontoa.concurrenttaskschedulerjava.governance.GovernanceStore;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.DefaultHandlerRegistry;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.HandlerRegistry;
 import com.github.highcumontoa.concurrenttaskschedulerjava.quota.QuotaKey;
@@ -20,6 +21,11 @@ public class SchedulerConfiguration {
     @Bean
     public TaskStore taskStore(SchedulerProperties props) {
         return new WalTaskStore(props.getWalFile(), props.isWalFsync());
+    }
+
+    @Bean
+    public GovernanceStore governanceStore(SchedulerProperties props) {
+        return new GovernanceStore(props.getGovernanceFile(), props.isWalFsync());
     }
 
     @Bean
@@ -59,7 +65,9 @@ public class SchedulerConfiguration {
     @Bean
     public TaskSchedulerService taskSchedulerService(TaskStore store, QuotaManager quotaManager,
                                                      HandlerRegistry handlerRegistry,
-                                                     SchedulerProperties props) {
-        return new TaskSchedulerService(store, quotaManager, handlerRegistry, props);
+                                                     SchedulerProperties props,
+                                                     GovernanceStore governanceStore) {
+        return new TaskSchedulerService(store, quotaManager, handlerRegistry, props,
+                governanceStore);
     }
 }

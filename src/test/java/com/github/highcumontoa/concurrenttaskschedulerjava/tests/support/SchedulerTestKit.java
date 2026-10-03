@@ -1,6 +1,7 @@
 package com.github.highcumontoa.concurrenttaskschedulerjava.tests.support;
 
 import com.github.highcumontoa.concurrenttaskschedulerjava.config.SchedulerProperties;
+import com.github.highcumontoa.concurrenttaskschedulerjava.governance.GovernanceStore;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.DefaultHandlerRegistry;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.SampleTaskHandler;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.TaskHandler;
@@ -19,6 +20,7 @@ public final class SchedulerTestKit implements AutoCloseable {
 
     public final SchedulerProperties props;
     public WalTaskStore store;
+    public GovernanceStore governanceStore;
     public QuotaManager quotaManager;
     public DefaultHandlerRegistry registry;
     public TaskSchedulerService service;
@@ -37,12 +39,13 @@ public final class SchedulerTestKit implements AutoCloseable {
         if (!fresh) {
             store = new WalTaskStore(props.getWalFile(), false);
         }
+        governanceStore = new GovernanceStore(props.getGovernanceFile(), false);
         quotaManager = new QuotaManager();
         quotaManager.setDefaultLimits(new QuotaLimits(props.getDefaultMaxConcurrency(),
                 props.getDefaultRateLimitPerSecond(), props.getDefaultMaxQueued()));
         registry = new DefaultHandlerRegistry();
         handlerFactories.forEach(f -> registry.register(f.get()));
-        service = new TaskSchedulerService(store, quotaManager, registry, props);
+        service = new TaskSchedulerService(store, quotaManager, registry, props, governanceStore);
         service.start();
     }
 
@@ -50,6 +53,7 @@ public final class SchedulerTestKit implements AutoCloseable {
     public SchedulerTestKit restart() {
         service.shutdown();
         store.close();
+        governanceStore.close();
         SchedulerTestKit kit = new SchedulerTestKit(props);
         kit.handlerFactories.addAll(this.handlerFactories);
         kit.boot(false);
@@ -64,6 +68,7 @@ public final class SchedulerTestKit implements AutoCloseable {
         closed = true;
         service.shutdown();
         store.close();
+        governanceStore.close();
     }
 
     public static final class Builder {
@@ -97,6 +102,7 @@ public final class SchedulerTestKit implements AutoCloseable {
         public SchedulerTestKit build() {
             SchedulerProperties props = new SchedulerProperties();
             props.setWalFile(walDir.resolve("scheduler.wal").toString());
+            props.setGovernanceFile(walDir.resolve("governance.wal").toString());
             props.setWalFsync(false);
             props.setWorkerThreads(workers);
             props.setDefaultMaxConcurrency(maxConcurrency);

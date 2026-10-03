@@ -23,6 +23,8 @@ public class QuotaManager {
         int active;
         long windowEpochSecond = Long.MIN_VALUE;
         int startedInWindow;
+        /** 暂停派发：新任务照常排队，但不再被启动；执行中任务不受影响。 */
+        boolean paused;
     }
 
     private final Map<QuotaKey, State> states = new ConcurrentHashMap<>();
@@ -143,5 +145,62 @@ public class QuotaManager {
             s.windowEpochSecond = epochSecond;
             s.startedInWindow = s.active;
         }
+    }
+
+    // ---------------------------------------------------------------- 运行期治理
+
+    /**
+     * 运行期调整某维度的三项配额，立即参与后续调度判定。
+     * 不合法的值（null / 任一项为负）抛出 {@link IllegalArgumentException}，
+     * 原有生效值保持不变。
+     *
+     * <p>调小并发上限不打断已在执行的任务（active 计数不变），
+     * 只是后续 {@link #tryAcquireActive} 按新上限判定；调大后由调度器触发派发，
+     * 积压任务按原有队头阻塞 FIFO 顺序放出。
+     */
+    public void adjustLimits(QuotaKey key, QuotaLimits limits) {
+        validate(key, limits);
+        overrides.put(key, limits);
+    }
+
+    private static void validate(QuotaKey key, QuotaLimits limits) {
+        if (key == null || limits == null) {
+            throw new IllegalArgumentException("key and limits must not be null");
+        }
+        if (limits.maxConcurrency() < 0 || limits.rateLimitPerSecond() < 0
+                || limits.maxQueued() < 0) {
+            throw new IllegalArgumentException(
+                    "quota values must be >= 0 (0 means unlimited): " + limits);
+        }
+    }
+
+    /** 暂停某维度派发：新任务照常入队，执行中任务自然跑完。 */
+    public void pause(QuotaKey key) {
+        State s = state(key);
+        synchronized (s) {
+            s.paused = true;
+        }
+    }
+
+    /** 恢复某维度派发。 */
+    public void resume(QuotaKey key) {
+        State s = state(key);
+        synchronized (s) {
+            s.paused = false;
+        }
+    }
+
+    public boolean isPaused(QuotaKey key) {
+        State s = state(key);
+        synchronized (s) {
+            return s.paused;
+        }
+    }
+
+    /** 当前已知（有计量状态或有配额覆盖）的全部维度。 */
+    public java.util.Set<QuotaKey> knownKeys() {
+        java.util.Set<QuotaKey> keys = new java.util.LinkedHashSet<>(states.keySet());
+        keys.addAll(overrides.keySet());
+        return keys;
     }
 }

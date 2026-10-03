@@ -33,6 +33,8 @@ public class SchedulerProperties {
     private double backoffJitter = 0.0;
     /** WAL 文件路径。 */
     private String walFile = "data/task-scheduler.wal";
+    /** 治理状态（运行期配额/暂停）WAL 文件路径。 */
+    private String governanceFile = "data/task-scheduler.governance.wal";
     /** 每次写 WAL 是否 fsync（测试关盘可关闭）。 */
     private boolean walFsync = true;
     /** 按 caller 或 caller:group 覆盖配额。 */
@@ -73,6 +75,8 @@ public class SchedulerProperties {
     public void setBackoffJitter(double v) { this.backoffJitter = v; }
     public String getWalFile() { return walFile; }
     public void setWalFile(String walFile) { this.walFile = walFile; }
+    public String getGovernanceFile() { return governanceFile; }
+    public void setGovernanceFile(String governanceFile) { this.governanceFile = governanceFile; }
     public boolean isWalFsync() { return walFsync; }
     public void setWalFsync(boolean walFsync) { this.walFsync = walFsync; }
     public Map<String, QuotaOverride> getQuotas() { return quotas; }
