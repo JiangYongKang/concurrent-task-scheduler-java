@@ -3,12 +3,14 @@ package com.github.highcumontoa.concurrenttaskschedulerjava.governance;
 import com.github.highcumontoa.concurrenttaskschedulerjava.quota.QuotaLimits;
 
 /**
- * 某个维度（caller + group）的治理状态持久化记录。
+ * 某个治理作用域（见 {@link GovernanceScope}：caller+group / 仅 caller / 仅 group）
+ * 的治理状态持久化记录。
  *
- * <p>以 JSON Lines 追加到治理 WAL，同一维度以最新一行为准回放，
+ * <p>callerId 为 null 表示按任务组整体治理；group 为 null 表示按调用方整体治理；
+ * 两者不能同时为 null。以 JSON Lines 追加到治理 WAL，同一作用域以最新一行为准回放，
  * 因此运行期的配额调整与暂停/恢复状态都能跨进程重启保留。
  *
- * <p>limits 为 null 表示该维度没有运行期配额覆盖（回落到配置/默认值）。
+ * <p>limits 为 null 表示该作用域没有运行期配额覆盖（回落到更宽作用域/配置/默认值）。
  */
 public class GovernanceRecord {
 

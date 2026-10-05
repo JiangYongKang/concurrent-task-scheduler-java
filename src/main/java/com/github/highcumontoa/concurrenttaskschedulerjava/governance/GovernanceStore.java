@@ -2,7 +2,6 @@ package com.github.highcumontoa.concurrenttaskschedulerjava.governance;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.highcumontoa.concurrenttaskschedulerjava.quota.QuotaKey;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,7 +34,7 @@ public class GovernanceStore implements AutoCloseable {
     private final Path path;
     private final boolean fsyncEachWrite;
     private final ObjectMapper mapper;
-    private final Map<QuotaKey, GovernanceRecord> index = new LinkedHashMap<>();
+    private final Map<GovernanceScope, GovernanceRecord> index = new LinkedHashMap<>();
     private FileOutputStream fos;
 
     public GovernanceStore(String filePath, boolean fsyncEachWrite) {
@@ -75,7 +74,7 @@ public class GovernanceStore implements AutoCloseable {
                         log.warn("治理 WAL 撕裂/损坏行，将从偏移 {} 截断: {}", lineStart,
                                 parseError.getMessage());
                     }
-                    if (record == null || record.getCallerId() == null) {
+                    if (record == null || !hasScope(record)) {
                         break;
                     }
                     index.put(keyOf(record), record);
@@ -98,14 +97,21 @@ public class GovernanceStore implements AutoCloseable {
         log.info("治理 WAL 恢复完成: {} 个维度, 文件={}", index.size(), path);
     }
 
-    private static QuotaKey keyOf(GovernanceRecord r) {
-        return QuotaKey.of(r.getCallerId(), r.getGroup());
+    private static GovernanceScope keyOf(GovernanceRecord r) {
+        return GovernanceScope.of(r.getCallerId(), r.getGroup());
+    }
+
+    /** 作用域信息完整：callerId 与 group 至少一个非空白。 */
+    private static boolean hasScope(GovernanceRecord r) {
+        return (r.getCallerId() != null && !r.getCallerId().isBlank())
+                || (r.getGroup() != null && !r.getGroup().isBlank());
     }
 
     /** 追加一条治理状态快照（返回后即视为已落盘）。 */
     public synchronized void append(GovernanceRecord record) {
-        if (record.getCallerId() == null || record.getCallerId().isBlank()) {
-            throw new IllegalArgumentException("callerId must not be blank");
+        if (!hasScope(record)) {
+            throw new IllegalArgumentException(
+                    "callerId and group must not both be absent (missing governance scope)");
         }
         try {
             fos.write(mapper.writeValueAsBytes(record));

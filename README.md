@@ -12,8 +12,10 @@
 - 提交幂等：相同 `taskId` 的重复提交（含高并发下的同时提交）只接受一次、只执行一次、只占一份配额。
 - 状态持久化到本地 WAL；进程重启后终态不回退、排队任务不丢失、执行中崩溃的任务重新排队、配额不泄漏。
 - 失败任务支持**指数退避重试**与终止策略；不可重试错误、取消、超时立即终止，绝不无限重试或重复执行。
-- **运行期治理**：无需重启即可按调用方/任务组调整三项配额、暂停/恢复派发，
-  并随时查询各维度运行态；治理状态持久化，重启后保持。
+- **运行期治理**：无需重启即可调整三项配额、暂停/恢复派发，并随时查询运行态。
+  支持三种作用域——精确到 `callerId + group`、**按调用方整体**（只给 `callerId`，
+  作用于其下所有任务组）、**按任务组整体**（只给 `group`，作用于其下所有调用方）；
+  治理状态持久化，重启后保持。
 
 ## 2. 任务状态机
 
@@ -66,40 +68,67 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
 在不动原有提交、幂等、重试、取消与重启恢复语义的前提下，提供三个运行期治理能力，
 全部通过 HTTP 接口触发，**立即生效并持久化**（治理 WAL，见第 7 节）。
 
+### 4.0 治理作用域与优先级
+
+每个治理操作的作用域由请求里 `callerId` / `group` 的组合决定：
+
+| callerId | group | 作用域（`scope`） | 作用范围 |
+| --- | --- | --- | --- |
+| 提供 | 提供 | `CALLER_GROUP` | 精确到该调用方的该任务组 |
+| 提供 | 不提供 | `CALLER` | 该调用方下的**所有**任务组 |
+| 不提供 | 提供 | `GROUP` | 该任务组下的**所有**调用方 |
+| 不提供 | 不提供 | — | **非法**，HTTP 400 `INVALID_REQUEST` |
+
+`null`（JSON 里不写该字段）才表示“不指定该维度”；空白字符串是非法输入，同样 400。
+
+- **配额解析优先级**（对每个运行维度 `(caller, group)` 判定生效值）：
+  精确维度覆盖 > 调用方整体覆盖 > 任务组整体覆盖 > 静态配置/默认值。
+  整体配额是“该作用域下每个运行维度各自的生效上限”，运行计数仍按精确维度统计。
+- **暂停是叠加语义**：任一作用域（精确 / 调用方 / 任务组）处于暂停，该维度即暂停派发；
+  恢复某一作用域不会抵消其它作用域的暂停。
+- **互不串扰**：精确到 `alice:g1` 的调整或暂停只影响 `alice:g1`，不改 `alice` 的其它组，
+  也不改其它调用方的 `g1`；调用方整体操作只影响该调用方，任务组整体操作只影响该任务组。
+
 ### 4.1 配额热调整
 
-`PUT /api/governance/quota`，body：
+`PUT /api/governance/quota`，body（精确维度示例）：
 
 ```json
 {"callerId":"alice","group":"daily-report","maxConcurrency":4,"rateLimitPerSecond":0,"maxQueued":200}
 ```
 
-- 三项配额必须**全部给出且 >= 0**（0 表示不限，`group` 缺省为 `default`）；
-  改完立即参与后续调度判定。
+按调用方整体：去掉 `group` 字段；按任务组整体：去掉 `callerId` 字段。
+
+- 三项配额必须**全部给出且 >= 0**（0 表示不限）；改完立即参与后续调度判定。
 - **调小并发上限**：已在执行的任务不被中断、状态不回退，只是不再按旧上限放行新任务；
   执行中任务自然结束后，占用降到新上限以下才会继续派发。
 - **调大上限**：积压的排队任务按原有队头阻塞 FIFO 顺序尽快放出。
-- **非法值**（缺项 / 任一项为负 / callerId 为空）：HTTP 400 `INVALID_REQUEST`，
-  原有生效值与已持久化的治理状态都保持不变。
+- **非法值**（缺项 / 任一项为负 / callerId 与 group 都没给 / 空白字符串）：
+  HTTP 400 `INVALID_REQUEST`，原有生效值与已持久化的治理状态都保持不变。
 
 ### 4.2 暂停与恢复派发
 
-`POST /api/governance/pause` / `POST /api/governance/resume`，body：`{"callerId":"alice","group":"g"}`。
+`POST /api/governance/pause` / `POST /api/governance/resume`，
+body 同样按 4.0 的作用域规则给 `callerId` / `group`
+（如 `{"callerId":"alice"}` 暂停整个调用方，`{"group":"g"}` 暂停整个任务组）。
 
-- 暂停期间：该维度**新提交照常受理并排队**（不拒绝、不丢失），执行中任务自然跑完，
+- 暂停期间：作用范围内**新提交照常受理并排队**（不拒绝、不丢失），执行中任务自然跑完，
   只是不再启动新任务；排队上限等既有配额判定不受影响。
 - 恢复后：排队任务按原公平顺序继续执行。
 - 暂停/恢复状态与配额调整一样**跨进程重启保留**，重启不会自动恢复放量。
 
 ### 4.3 运行态查询
 
-`GET /api/governance/status?callerId=alice&group=g` 查单个维度；不带参数列出全部已知维度。返回：
+`GET /api/governance/status`：
+
+- `?callerId=alice&group=g` 查精确维度；`?callerId=alice` 查调用方整体（各组计数合计）；
+  `?group=g` 查任务组整体（各调用方计数合计）；不带参数列出全部已知作用域。
 
 ```json
 {
-  "callerId": "alice", "group": "g",
+  "scope": "CALLER", "callerId": "alice", "group": null,
   "maxConcurrency": 4, "rateLimitPerSecond": 0, "maxQueued": 200,
-  "active": 2, "queued": 5, "startedInCurrentWindow": 1,
+  "active": 3, "queued": 7, "startedInCurrentWindow": 2,
   "paused": false,
   "lastOperation": "ADJUST_QUOTA",
   "lastOperationAtEpochMillis": 1759550000000,
@@ -107,9 +136,12 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
 }
 ```
 
-计数（`active` / `queued` / `startedInCurrentWindow`）与调度判定在同一临界区内读取：
-并发提交与并发调整同时进行时，视图与实际判定一致，
-已被拒绝或已结束的任务不会残留在排队统计里。
+- `scope` 标识作用域类型；整体作用域的 `active` / `queued` / `startedInCurrentWindow`
+  是范围内所有精确维度的合计，限额字段展示该作用域自身的覆盖值（无覆盖时为默认值）。
+- 精确维度的 `paused` 是**有效暂停状态**（任一作用域暂停即为 true，与调度判定一致）；
+  整体作用域的 `paused` 是该作用域自身的暂停标记。
+- 计数与调度判定在同一临界区内读取：并发提交与并发调整同时进行时，视图与实际判定一致，
+  已被拒绝或已结束的任务不会残留在排队统计里。
 
 ### 4.4 与既有能力的兼容范围
 
@@ -117,6 +149,8 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
 - 运行期配额覆盖持久化在治理 WAL 中，优先级高于 `application.properties` 的
   `task.scheduler.quotas.*` 静态配置（重启后先应用静态配置，再回放治理 WAL）。
 - 治理 WAL 与任务 WAL 是**两个独立文件**，互不影响撕裂截断与回放逻辑。
+- 静态配置 `quotas.<caller>.*` 仍只作用于该 caller 的 `default` 组（既有行为不变）；
+  需要“调用方整体”语义时请使用运行期治理接口。
 
 ## 5. 提交 / 幂等约定
 
@@ -154,9 +188,10 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
   - `RUNNING`（崩溃时在执行）重新置为 `QUEUED` 再执行一次，绝不静默丢失；
   - 配额计数按恢复结果 `reinitialize`，防止配额泄漏/超发。
 - 崩溃导致最后一行写一半时，打开 WAL 会检测并**截断撕裂尾部**，此前完整记录不受影响。
-- 治理状态（运行期配额覆盖 + 暂停标记）持久化在独立的治理 WAL
+- 治理状态（运行期配额覆盖 + 暂停标记，含精确维度 / 调用方整体 / 任务组整体三种作用域）
+  持久化在独立的治理 WAL
   （默认 `data/task-scheduler.governance.wal`，可用 `governance-file` 调整）：
-  同样的 JSON Lines 追加 + 撕裂截断策略，重启后按维度回放最新一条，
+  同样的 JSON Lines 追加 + 撕裂截断策略，重启后按作用域回放最新一条，
   配额调整与暂停状态都不会因重启丢失。
 
 ## 8. HTTP 接口
@@ -167,10 +202,10 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
 | `GET /api/tasks/{taskId}` | 查询单个任务（404 `TASK_NOT_FOUND`） |
 | `GET /api/tasks` | 列出全部任务 |
 | `POST /api/tasks/{taskId}/cancel?reason=...` | 取消，返回 `{taskId, cancelled}` |
-| `PUT /api/governance/quota` | 运行期调整某维度三项配额（非法值 400 且原值不变） |
-| `POST /api/governance/pause` | 暂停某维度派发（新任务照常排队） |
-| `POST /api/governance/resume` | 恢复某维度派发 |
-| `GET /api/governance/status[?callerId&group]` | 查询单个或全部维度的运行态 |
+| `PUT /api/governance/quota` | 运行期调整三项配额（作用域见 4.0；非法值 400 且原值不变） |
+| `POST /api/governance/pause` | 暂停派发，作用域同上（新任务照常排队） |
+| `POST /api/governance/resume` | 恢复派发，作用域同上 |
+| `GET /api/governance/status[?callerId][&group]` | 按作用域查询运行态；不带参数列出全部已知作用域 |
 
 提交请求：
 
@@ -232,14 +267,15 @@ task.scheduler.quotas.bob:batch.max-queued=200
 环境：JDK 21+、Maven 3.9+。
 
 ```bash
-# 全量测试（32 个：并发配额、重复提交、取消/超时、重试、重启恢复、WAL 完整性、
-# 运行期治理、HTTP）
+# 全量测试（40 个：并发配额、重复提交、取消/超时、重试、重启恢复、WAL 完整性、
+# 运行期治理（精确维度 + 按调用方/任务组整体）、HTTP）
 mvn test
 
 # 单个套件
 mvn test -Dtest=ConcurrencyQuotaTests
 mvn test -Dtest=RestartRecoveryTests
 mvn test -Dtest=RuntimeGovernanceTests
+mvn test -Dtest=ScopedGovernanceTests
 
 # 启动服务后手工验证
 mvn spring-boot:run
@@ -248,7 +284,7 @@ curl -s -XPOST localhost:8080/api/tasks -H 'Content-Type: application/json' -d '
 curl -s localhost:8080/api/tasks/t1
 curl -s -XPOST 'localhost:8080/api/tasks/t1/cancel?reason=abort'
 
-# 运行期治理：热调配额、暂停/恢复、查运行态（重启后状态保留）
+# 运行期治理（精确维度）：热调配额、暂停/恢复、查运行态（重启后状态保留）
 curl -s -XPUT localhost:8080/api/governance/quota -H 'Content-Type: application/json' -d '{
   "callerId":"alice","group":"g","maxConcurrency":1,"rateLimitPerSecond":0,"maxQueued":50}'
 curl -s -XPOST localhost:8080/api/governance/pause -H 'Content-Type: application/json' -d '{
@@ -256,6 +292,26 @@ curl -s -XPOST localhost:8080/api/governance/pause -H 'Content-Type: application
 curl -s 'localhost:8080/api/governance/status?callerId=alice&group=g'
 curl -s -XPOST localhost:8080/api/governance/resume -H 'Content-Type: application/json' -d '{
   "callerId":"alice","group":"g"}'
+
+# 按调用方整体（不带 group）：对该调用方所有任务组生效
+curl -s -XPUT localhost:8080/api/governance/quota -H 'Content-Type: application/json' -d '{
+  "callerId":"alice","maxConcurrency":2,"rateLimitPerSecond":0,"maxQueued":100}'
+curl -s -XPOST localhost:8080/api/governance/pause -H 'Content-Type: application/json' -d '{
+  "callerId":"alice"}'
+curl -s 'localhost:8080/api/governance/status?callerId=alice'
+curl -s -XPOST localhost:8080/api/governance/resume -H 'Content-Type: application/json' -d '{
+  "callerId":"alice"}'
+
+# 按任务组整体（不带 callerId）：对该任务组所有调用方生效
+curl -s -XPUT localhost:8080/api/governance/quota -H 'Content-Type: application/json' -d '{
+  "group":"shared","maxConcurrency":1,"rateLimitPerSecond":0,"maxQueued":20}'
+curl -s -XPOST localhost:8080/api/governance/pause -H 'Content-Type: application/json' -d '{
+  "group":"shared"}'
+curl -s 'localhost:8080/api/governance/status?group=shared'
+curl -s -XPOST localhost:8080/api/governance/resume -H 'Content-Type: application/json' -d '{
+  "group":"shared"}'
+
+# 列出全部已知作用域的运行态
 curl -s localhost:8080/api/governance/status
 ```
 
@@ -269,8 +325,9 @@ curl -s localhost:8080/api/governance/status
 ```
 config/      SchedulerProperties、Spring 装配（默认/覆盖配额、处理器注册、治理存储）
 model/       TaskRecord（WAL 快照）、TaskStatus、RejectReason、TaskException
-quota/       QuotaManager（并发槽位 + 固定窗口速率 + 排队计数 + 暂停标记）、QuotaStatus
-governance/  GovernanceRecord、GovernanceStore（治理状态 JSON Lines WAL + 撕裂截断恢复）
+quota/       QuotaManager（并发槽位 + 固定窗口速率 + 排队计数 + 三作用域配额/暂停）、QuotaStatus
+governance/  GovernanceScope（三种治理作用域）、GovernanceRecord、
+             GovernanceStore（治理状态 JSON Lines WAL + 撕裂截断恢复）
 retry/       RetryPolicy、指数退避实现、错误分类、NonRetryableTaskException
 handler/     TaskHandler/TaskContext、注册表、内置 sample 处理器
 store/       TaskStore、WalTaskStore（JSON Lines WAL + 撕裂截断恢复）

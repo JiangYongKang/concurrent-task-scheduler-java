@@ -197,15 +197,25 @@ class RuntimeGovernanceTests {
             awaitStarts(gate, 1);
             assertEquals(TaskStatus.QUEUED, kit.service.get("b2").orElseThrow().getStatus());
 
-            // 运行期把并发从 1 调到 3：积压任务立即按原顺序放出
-            QuotaStatus st = kit.service.adjustQuota("alice", "g", 3, 0, 100);
+            // 运行期把并发从 1 调到 2：队头 b2 立即放出（b1 仍在执行占 1 槽）。
+            // 分步扩容保证每步只放出一个任务，启动顺序由调度器 FIFO 唯一确定
+            // （一次放出多个时，各 worker 线程进入处理器的先后不可控，断言顺序会抖动）。
+            QuotaStatus st = kit.service.adjustQuota("alice", "g", 2, 0, 100);
+            assertEquals(2, st.maxConcurrency());
+            awaitStarts(gate, 2);
+            assertEquals(List.of("b1", "b2"), gate.startOrder,
+                    "扩容后必须先按入队顺序放出队头 b2");
+            assertEquals(TaskStatus.QUEUED, kit.service.get("b3").orElseThrow().getStatus(),
+                    "新上限 2 用满后 b3 仍排队");
+
+            // 再调到 3：b3 放出，b4 仍排队
+            st = kit.service.adjustQuota("alice", "g", 3, 0, 100);
             assertEquals(3, st.maxConcurrency());
             awaitStarts(gate, 3);
-            assertEquals(List.of("b1", "b2", "b3"), gate.startOrder,
-                    "扩容后必须按入队顺序放出积压任务");
+            assertEquals("b3", gate.startOrder.get(2), "继续扩容后必须按序放出 b3");
             assertEquals(TaskStatus.QUEUED, kit.service.get("b4").orElseThrow().getStatus(),
                     "新上限 3 用满后 b4 仍排队");
-            log.info("[配额判定] 扩容 1->3 后按序放出 b2/b3，b4 等待空槽");
+            log.info("[配额判定] 分步扩容 1->2->3 后按序放出 b2/b3，b4 等待空槽");
             assertCountsConsistent(kit.service, "alice", "g");
 
             gate.openAll();
@@ -299,15 +309,24 @@ class RuntimeGovernanceTests {
             sleep(200);
             assertEquals(1, gate.totalStarts.get(), "p0 完成后暂停仍然生效，不得补位");
 
-            // 恢复后按原公平顺序继续执行
+            // 恢复后按原公平顺序继续执行。恢复前把并发调为 1：一次只放出一个，
+            // 启动顺序由调度器 FIFO 唯一确定（上限 2 时 p1/p2 同时派发到不同
+            // worker 线程，线程进入处理器的先后不可控，断言顺序会抖动）。
+            kit.service.adjustQuota("alice", "g", 1, 0, 100);
             QuotaStatus resumed = kit.service.resume("alice", "g");
             assertFalse(resumed.paused());
             assertEquals("RESUME", resumed.lastOperation());
-            awaitStarts(gate, 3); // 上限 2：p1、p2 启动
-            gate.openAll();
-            for (int i = 1; i <= 3; i++) {
-                awaitStatus(kit.service, "p" + i, TaskStatus.SUCCEEDED);
-            }
+            awaitStarts(gate, 2); // 上限 1：p0 完成后 p1 单独启动
+            assertEquals("p1", gate.startOrder.get(1), "恢复后必须先放出队头 p1");
+            gate.open("p1");
+            awaitStatus(kit.service, "p1", TaskStatus.SUCCEEDED);
+            awaitStarts(gate, 3);
+            assertEquals("p2", gate.startOrder.get(2));
+            gate.open("p2");
+            awaitStatus(kit.service, "p2", TaskStatus.SUCCEEDED);
+            awaitStarts(gate, 4);
+            gate.open("p3");
+            awaitStatus(kit.service, "p3", TaskStatus.SUCCEEDED);
             assertEquals(List.of("p0", "p1", "p2", "p3"), gate.startOrder,
                     "恢复后必须按原入队顺序执行");
             assertCountsConsistent(kit.service, "alice", "g");
@@ -353,11 +372,17 @@ class RuntimeGovernanceTests {
             log.info("[治理] 重启后暂停与配额调整保持: paused=true 限额=5/0/50 queued=2");
             assertCountsConsistent(restarted.service, "alice", "g");
 
-            // 恢复后排队任务继续执行
+            // 恢复后排队任务继续执行。先把并发调回 1：一次只放出一个，
+            // 启动顺序由调度器 FIFO 唯一确定（上限 5 时两个任务同时派发到不同
+            // worker 线程，线程进入处理器的先后不可控，断言顺序会抖动）。
+            restarted.service.adjustQuota("alice", "g", 1, 0, 50);
             restarted.service.resume("alice", "g");
-            awaitStarts(gate, 2);
-            gate.openAll();
+            awaitStarts(gate, 1);
+            assertEquals("q1", gate.startOrder.get(0), "恢复后必须按入队顺序先放出 q1");
+            gate.open("q1");
             awaitStatus(restarted.service, "q1", TaskStatus.SUCCEEDED);
+            awaitStarts(gate, 2);
+            gate.open("q2");
             awaitStatus(restarted.service, "q2", TaskStatus.SUCCEEDED);
             assertEquals(List.of("q1", "q2"), gate.startOrder);
             assertCountsConsistent(restarted.service, "alice", "g");

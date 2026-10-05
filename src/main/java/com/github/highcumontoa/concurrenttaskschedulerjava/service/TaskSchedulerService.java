@@ -2,6 +2,7 @@ package com.github.highcumontoa.concurrenttaskschedulerjava.service;
 
 import com.github.highcumontoa.concurrenttaskschedulerjava.config.SchedulerProperties;
 import com.github.highcumontoa.concurrenttaskschedulerjava.governance.GovernanceRecord;
+import com.github.highcumontoa.concurrenttaskschedulerjava.governance.GovernanceScope;
 import com.github.highcumontoa.concurrenttaskschedulerjava.governance.GovernanceStore;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.HandlerRegistry;
 import com.github.highcumontoa.concurrenttaskschedulerjava.handler.TaskContext;
@@ -63,8 +64,8 @@ public class TaskSchedulerService {
     private final Map<String, TaskRecord> tasks = new LinkedHashMap<>();
     /** 正在执行的运行句柄（taskId -> handle）。 */
     private final Map<String, RunningTask> running = new LinkedHashMap<>();
-    /** 各维度最近一次治理操作（内存镜像，与治理 WAL 一致）。 */
-    private final Map<QuotaKey, GovernanceRecord> governance = new LinkedHashMap<>();
+    /** 各作用域最近一次治理操作（内存镜像，与治理 WAL 一致）。 */
+    private final Map<GovernanceScope, GovernanceRecord> governance = new LinkedHashMap<>();
 
     private final ThreadPoolExecutor workers;
     private final ScheduledExecutorService timers;
@@ -148,20 +149,20 @@ public class TaskSchedulerService {
             // 回放治理 WAL：运行期配额覆盖与暂停状态跨重启保留，
             // 不会因为重启而自动恢复放量或丢失调整。
             for (GovernanceRecord g : governanceStore.loadAll()) {
-                QuotaKey key = QuotaKey.of(g.getCallerId(), g.getGroup());
+                GovernanceScope scope = GovernanceScope.of(g.getCallerId(), g.getGroup());
                 try {
                     if (g.getLimits() != null) {
-                        quotaManager.adjustLimits(key, g.getLimits());
+                        applyLimits(scope, g.getLimits());
                     }
                 } catch (IllegalArgumentException invalid) {
-                    log.warn("治理 WAL 中 {} 的配额覆盖非法，忽略: {}", key, invalid.getMessage());
+                    log.warn("治理 WAL 中 {} 的配额覆盖非法，忽略: {}", scope, invalid.getMessage());
                 }
                 if (g.isPaused()) {
-                    quotaManager.pause(key);
+                    applyPause(scope, true);
                 }
-                governance.put(key, g);
-                log.info("[治理] 恢复维度状态 caller={} group={} paused={} limits={} 最近操作={}@{}",
-                        key.callerId(), key.group(), g.isPaused(), g.getLimits(),
+                governance.put(scope, g);
+                log.info("[治理] 恢复作用域状态 scope={} paused={} limits={} 最近操作={}@{}",
+                        scope, g.isPaused(), g.getLimits(),
                         g.getLastOperation(), g.getUpdatedAtEpochMillis());
             }
             dispatcher.scheduleWithFixedDelay(this::safeDispatch, 5, 10, TimeUnit.MILLISECONDS);
@@ -307,13 +308,15 @@ public class TaskSchedulerService {
     // ---------------------------------------------------------------- 运行期治理
 
     /**
-     * 运行期调整某维度三项配额，立即参与后续调度判定并持久化（重启后仍生效）。
+     * 运行期调整三项配额，立即参与后续调度判定并持久化（重启后仍生效）。
+     * 作用域由参数决定：callerId 与 group 都给 = 精确维度；只给 callerId = 调用方整体；
+     * 只给 group = 任务组整体；都不给或任一为空白字符串 = 非法。
      * 非法值抛出 {@link IllegalArgumentException}，原有生效值不变。
      * 调小并发上限不打断执行中任务；调大后立即触发派发放出积压。
      */
     public QuotaStatus adjustQuota(String callerId, String group, Integer maxConcurrency,
                                    Integer rateLimitPerSecond, Integer maxQueued) {
-        QuotaKey key = governanceKey(callerId, group);
+        GovernanceScope scope = governanceScope(callerId, group);
         if (maxConcurrency == null || rateLimitPerSecond == null || maxQueued == null) {
             throw new IllegalArgumentException(
                     "maxConcurrency/rateLimitPerSecond/maxQueued must all be provided");
@@ -321,8 +324,8 @@ public class TaskSchedulerService {
         QuotaLimits limits = new QuotaLimits(maxConcurrency, rateLimitPerSecond, maxQueued);
         synchronized (lock) {
             // 先校验再落盘再生效：非法值在这里抛出，原有生效值与持久化状态都不变。
-            quotaManager.adjustLimits(key, limits);
-            GovernanceRecord rec = mergedRecord(key);
+            applyLimits(scope, limits);
+            GovernanceRecord rec = mergedRecord(scope);
             rec.setLimits(limits);
             rec.setLastOperation("ADJUST_QUOTA");
             rec.setLastOperationDetail("maxConcurrency=" + limits.maxConcurrency()
@@ -330,99 +333,205 @@ public class TaskSchedulerService {
                     + ", maxQueued=" + limits.maxQueued());
             rec.setUpdatedAtEpochMillis(System.currentTimeMillis());
             governanceStore.append(rec);
-            governance.put(key, rec);
-            log.info("[治理] 配额调整 caller={} group={} -> {} 当前 active={} queued={} paused={}",
-                    key.callerId(), key.group(), rec.getLastOperationDetail(),
-                    quotaManager.activeCount(key), quotaManager.queuedCount(key),
-                    quotaManager.isPaused(key));
+            governance.put(scope, rec);
+            log.info("[治理] 配额调整 scope={} -> {} {}", scope, rec.getLastOperationDetail(),
+                    scopeCounters(scope));
         }
         // 锁外触发派发：调大上限后积压任务按原顺序尽快放出。
         safeDispatch();
         return governanceStatus(callerId, group);
     }
 
-    /** 暂停某维度派发：新任务照常受理排队，执行中任务自然跑完；状态持久化。 */
+    /** 暂停派发：新任务照常受理排队，执行中任务自然跑完；状态持久化。 */
     public QuotaStatus pause(String callerId, String group) {
-        QuotaKey key = governanceKey(callerId, group);
+        GovernanceScope scope = governanceScope(callerId, group);
         synchronized (lock) {
-            quotaManager.pause(key);
-            GovernanceRecord rec = mergedRecord(key);
+            applyPause(scope, true);
+            GovernanceRecord rec = mergedRecord(scope);
             rec.setPaused(true);
             rec.setLastOperation("PAUSE");
             rec.setLastOperationDetail("paused=true");
             rec.setUpdatedAtEpochMillis(System.currentTimeMillis());
             governanceStore.append(rec);
-            governance.put(key, rec);
-            log.info("[治理] 暂停派发 caller={} group={} 已入队任务继续排队 queued={} "
-                    + "执行中任务自然跑完 active={}", key.callerId(), key.group(),
-                    quotaManager.queuedCount(key), quotaManager.activeCount(key));
+            governance.put(scope, rec);
+            log.info("[治理] 暂停派发 scope={} 已入队任务继续排队、执行中任务自然跑完 {}",
+                    scope, scopeCounters(scope));
         }
         return governanceStatus(callerId, group);
     }
 
-    /** 恢复某维度派发：排队任务按原公平顺序继续执行；状态持久化。 */
+    /** 恢复派发：排队任务按原公平顺序继续执行；状态持久化。 */
     public QuotaStatus resume(String callerId, String group) {
-        QuotaKey key = governanceKey(callerId, group);
+        GovernanceScope scope = governanceScope(callerId, group);
         synchronized (lock) {
-            quotaManager.resume(key);
-            GovernanceRecord rec = mergedRecord(key);
+            applyPause(scope, false);
+            GovernanceRecord rec = mergedRecord(scope);
             rec.setPaused(false);
             rec.setLastOperation("RESUME");
             rec.setLastOperationDetail("paused=false");
             rec.setUpdatedAtEpochMillis(System.currentTimeMillis());
             governanceStore.append(rec);
-            governance.put(key, rec);
-            log.info("[治理] 恢复派发 caller={} group={} 积压 queued={} 将按原顺序放出",
-                    key.callerId(), key.group(), quotaManager.queuedCount(key));
+            governance.put(scope, rec);
+            log.info("[治理] 恢复派发 scope={} 积压任务将按原顺序放出 {}",
+                    scope, scopeCounters(scope));
         }
         safeDispatch();
         return governanceStatus(callerId, group);
     }
 
-    /** 查询某维度当前运行态（计数、生效配额、暂停状态、最近治理操作）。 */
+    /** 查询某作用域当前运行态（计数、生效配额、暂停状态、最近治理操作）。 */
     public QuotaStatus governanceStatus(String callerId, String group) {
-        QuotaKey key = governanceKey(callerId, group);
+        GovernanceScope scope = governanceScope(callerId, group);
         synchronized (lock) {
-            return snapshotLocked(key);
+            return snapshotLocked(scope);
         }
     }
 
-    /** 列出所有已知维度的运行态。 */
+    /** 列出所有已知作用域（精确维度 + 调用方整体 + 任务组整体）的运行态。 */
     public List<QuotaStatus> listGovernanceStatus() {
         synchronized (lock) {
-            java.util.Set<QuotaKey> keys = new java.util.TreeSet<>(
-                    java.util.Comparator.comparing(QuotaKey::callerId)
-                            .thenComparing(QuotaKey::group));
-            keys.addAll(quotaManager.knownKeys());
-            keys.addAll(governance.keySet());
+            java.util.Set<GovernanceScope> scopes = new java.util.TreeSet<>(
+                    java.util.Comparator.comparing(GovernanceScope::toString));
+            for (QuotaKey key : quotaManager.knownKeys()) {
+                scopes.add(GovernanceScope.of(key.callerId(), key.group()));
+            }
+            for (String caller : quotaManager.knownCallerScopes()) {
+                scopes.add(GovernanceScope.of(caller, null));
+            }
+            for (String group : quotaManager.knownGroupScopes()) {
+                scopes.add(GovernanceScope.of(null, group));
+            }
+            scopes.addAll(governance.keySet());
             List<QuotaStatus> result = new java.util.ArrayList<>();
-            for (QuotaKey key : keys) {
-                result.add(snapshotLocked(key));
+            for (GovernanceScope scope : scopes) {
+                result.add(snapshotLocked(scope));
             }
             return result;
         }
     }
 
-    /** 在锁内读取某维度的一致快照：计数与调度判定使用同一临界区。 */
-    private QuotaStatus snapshotLocked(QuotaKey key) {
-        QuotaLimits l = quotaManager.limits(key);
-        GovernanceRecord g = governance.get(key);
-        return new QuotaStatus(key.callerId(), key.group(),
-                l.maxConcurrency(), l.rateLimitPerSecond(), l.maxQueued(),
-                quotaManager.activeCount(key), quotaManager.queuedCount(key),
-                quotaManager.startedInCurrentWindow(key),
-                quotaManager.isPaused(key),
-                g == null ? null : g.getLastOperation(),
-                g == null ? 0L : g.getUpdatedAtEpochMillis(),
-                g == null ? null : g.getLastOperationDetail());
+    /** 按作用域把配额覆盖写入 QuotaManager（先校验，非法值在此抛出）。 */
+    private void applyLimits(GovernanceScope scope, QuotaLimits limits) {
+        switch (scope.kind()) {
+            case CALLER_GROUP -> quotaManager.adjustLimits(
+                    QuotaKey.of(scope.callerId(), scope.group()), limits);
+            case CALLER -> quotaManager.adjustCallerLimits(scope.callerId(), limits);
+            case GROUP -> quotaManager.adjustGroupLimits(scope.group(), limits);
+        }
+    }
+
+    /** 按作用域设置/清除暂停标记。 */
+    private void applyPause(GovernanceScope scope, boolean paused) {
+        switch (scope.kind()) {
+            case CALLER_GROUP -> {
+                if (paused) {
+                    quotaManager.pause(QuotaKey.of(scope.callerId(), scope.group()));
+                } else {
+                    quotaManager.resume(QuotaKey.of(scope.callerId(), scope.group()));
+                }
+            }
+            case CALLER -> {
+                if (paused) {
+                    quotaManager.pauseCaller(scope.callerId());
+                } else {
+                    quotaManager.resumeCaller(scope.callerId());
+                }
+            }
+            case GROUP -> {
+                if (paused) {
+                    quotaManager.pauseGroup(scope.group());
+                } else {
+                    quotaManager.resumeGroup(scope.group());
+                }
+            }
+        }
+    }
+
+    /** 在锁内读取某作用域的一致快照：计数与调度判定使用同一临界区。 */
+    private QuotaStatus snapshotLocked(GovernanceScope scope) {
+        GovernanceRecord g = governance.get(scope);
+        String lastOp = g == null ? null : g.getLastOperation();
+        long lastOpAt = g == null ? 0L : g.getUpdatedAtEpochMillis();
+        String lastOpDetail = g == null ? null : g.getLastOperationDetail();
+        switch (scope.kind()) {
+            case CALLER_GROUP -> {
+                QuotaKey key = QuotaKey.of(scope.callerId(), scope.group());
+                QuotaLimits l = quotaManager.limits(key);
+                return new QuotaStatus("CALLER_GROUP", key.callerId(), key.group(),
+                        l.maxConcurrency(), l.rateLimitPerSecond(), l.maxQueued(),
+                        quotaManager.activeCount(key), quotaManager.queuedCount(key),
+                        quotaManager.startedInCurrentWindow(key),
+                        quotaManager.isPaused(key),
+                        lastOp, lastOpAt, lastOpDetail);
+            }
+            case CALLER -> {
+                QuotaLimits l = quotaManager.callerLimits(scope.callerId());
+                int[] c = aggregateLocked(scope.callerId(), null);
+                return new QuotaStatus("CALLER", scope.callerId(), null,
+                        l.maxConcurrency(), l.rateLimitPerSecond(), l.maxQueued(),
+                        c[0], c[1], c[2],
+                        quotaManager.isCallerPaused(scope.callerId()),
+                        lastOp, lastOpAt, lastOpDetail);
+            }
+            default -> {
+                QuotaLimits l = quotaManager.groupLimits(scope.group());
+                int[] c = aggregateLocked(null, scope.group());
+                return new QuotaStatus("GROUP", null, scope.group(),
+                        l.maxConcurrency(), l.rateLimitPerSecond(), l.maxQueued(),
+                        c[0], c[1], c[2],
+                        quotaManager.isGroupPaused(scope.group()),
+                        lastOp, lastOpAt, lastOpDetail);
+            }
+        }
+    }
+
+    /** 在锁内按 caller 或 group 聚合全部精确维度的计数（active/queued/本秒启动）。 */
+    private int[] aggregateLocked(String callerId, String group) {
+        int active = 0;
+        int queued = 0;
+        int started = 0;
+        for (QuotaKey key : quotaManager.knownKeys()) {
+            if (callerId != null && !callerId.equals(key.callerId())) {
+                continue;
+            }
+            if (group != null && !group.equals(key.group())) {
+                continue;
+            }
+            active += quotaManager.activeCount(key);
+            queued += quotaManager.queuedCount(key);
+            started += quotaManager.startedInCurrentWindow(key);
+        }
+        return new int[]{active, queued, started};
+    }
+
+    /** 锁内日志用：作用域当前计数摘要。 */
+    private String scopeCounters(GovernanceScope scope) {
+        return switch (scope.kind()) {
+            case CALLER_GROUP -> {
+                QuotaKey key = QuotaKey.of(scope.callerId(), scope.group());
+                yield "active=" + quotaManager.activeCount(key)
+                        + " queued=" + quotaManager.queuedCount(key)
+                        + " paused=" + quotaManager.isPaused(key);
+            }
+            case CALLER -> {
+                int[] c = aggregateLocked(scope.callerId(), null);
+                yield "active=" + c[0] + " queued=" + c[1]
+                        + " callerPaused=" + quotaManager.isCallerPaused(scope.callerId());
+            }
+            case GROUP -> {
+                int[] c = aggregateLocked(null, scope.group());
+                yield "active=" + c[0] + " queued=" + c[1]
+                        + " groupPaused=" + quotaManager.isGroupPaused(scope.group());
+            }
+        };
     }
 
     /** 基于已有记录合并出完整治理状态（保留未涉及的字段，如暂停时保留配额覆盖）。 */
-    private GovernanceRecord mergedRecord(QuotaKey key) {
-        GovernanceRecord existing = governance.get(key);
+    private GovernanceRecord mergedRecord(GovernanceScope scope) {
+        GovernanceRecord existing = governance.get(scope);
         GovernanceRecord rec = new GovernanceRecord();
-        rec.setCallerId(key.callerId());
-        rec.setGroup(key.group());
+        rec.setCallerId(scope.callerId());
+        rec.setGroup(scope.group());
         if (existing != null) {
             rec.setPaused(existing.isPaused());
             rec.setLimits(existing.getLimits());
@@ -430,14 +539,13 @@ public class TaskSchedulerService {
         return rec;
     }
 
-    private static QuotaKey governanceKey(String callerId, String group) {
-        if (callerId == null || callerId.isBlank()) {
-            throw new IllegalArgumentException("callerId must not be blank");
-        }
-        if (group == null || group.isBlank()) {
-            group = "default";
-        }
-        return QuotaKey.of(callerId, group);
+    /**
+     * 解析治理作用域：callerId 与 group 至少给一个；null 表示该维度不指定
+     * （不指定 group = 调用方整体，不指定 callerId = 任务组整体）；
+     * 空白字符串是非法输入，直接拒绝。
+     */
+    private static GovernanceScope governanceScope(String callerId, String group) {
+        return GovernanceScope.of(callerId, group);
     }
 
     // ---------------------------------------------------------------- 派发

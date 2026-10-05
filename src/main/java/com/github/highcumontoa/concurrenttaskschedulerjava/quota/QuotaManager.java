@@ -14,6 +14,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>速率限制采用固定窗口（每个自然秒最多启动 rateLimitPerSecond 个），
  * 已消耗的窗口额度在执行结束时不回补，避免取消/快速失败刷启动速率。
  * 进程重启后由 {@link #reinitialize} 按 WAL 恢复占用，防止配额泄漏或超发。
+ *
+ * <p>运行期治理支持三种作用域：精确维度(caller+group)、调用方整体、任务组整体。
+ * 配额解析优先级：精确 &gt; 调用方 &gt; 任务组 &gt; 默认值；
+ * 暂停为叠加语义：任一作用域暂停即暂停该维度派发。
  */
 public class QuotaManager {
 
@@ -30,6 +34,16 @@ public class QuotaManager {
     private final Map<QuotaKey, State> states = new ConcurrentHashMap<>();
     private volatile QuotaLimits defaultLimits = new QuotaLimits(1, 0, 0);
     private final Map<QuotaKey, QuotaLimits> overrides = new ConcurrentHashMap<>();
+    /** 按调用方整体的配额覆盖（作用于该 caller 下所有组的维度）。 */
+    private final Map<String, QuotaLimits> callerOverrides = new ConcurrentHashMap<>();
+    /** 按任务组整体的配额覆盖（作用于该 group 下所有 caller 的维度）。 */
+    private final Map<String, QuotaLimits> groupOverrides = new ConcurrentHashMap<>();
+    /** 按调用方整体的暂停标记。 */
+    private final java.util.Set<String> pausedCallers =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** 按任务组整体的暂停标记。 */
+    private final java.util.Set<String> pausedGroups =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     public QuotaManager() {
     }
@@ -53,9 +67,21 @@ public class QuotaManager {
         overrides.put(key, limits);
     }
 
+    /**
+     * 某运行维度的生效配额，按作用域优先级解析：
+     * 精确维度(caller+group)覆盖 &gt; 调用方整体覆盖 &gt; 任务组整体覆盖 &gt; 默认值。
+     */
     public QuotaLimits limits(QuotaKey key) {
         QuotaLimits override = overrides.get(key);
-        return override != null ? override : defaultLimits;
+        if (override != null) {
+            return override;
+        }
+        QuotaLimits callerOverride = callerOverrides.get(key.callerId());
+        if (callerOverride != null) {
+            return callerOverride;
+        }
+        QuotaLimits groupOverride = groupOverrides.get(key.group());
+        return groupOverride != null ? groupOverride : defaultLimits;
     }
 
     public int activeCount(QuotaKey key) {
@@ -159,13 +185,34 @@ public class QuotaManager {
      * 积压任务按原有队头阻塞 FIFO 顺序放出。
      */
     public void adjustLimits(QuotaKey key, QuotaLimits limits) {
-        validate(key, limits);
+        if (key == null) {
+            throw new IllegalArgumentException("key must not be null");
+        }
+        validateLimits(limits);
         overrides.put(key, limits);
     }
 
-    private static void validate(QuotaKey key, QuotaLimits limits) {
-        if (key == null || limits == null) {
-            throw new IllegalArgumentException("key and limits must not be null");
+    /** 运行期调整某个调用方整体的三项配额：作用于该 caller 下所有组的维度。 */
+    public void adjustCallerLimits(String callerId, QuotaLimits limits) {
+        if (callerId == null || callerId.isBlank()) {
+            throw new IllegalArgumentException("callerId must not be blank");
+        }
+        validateLimits(limits);
+        callerOverrides.put(callerId, limits);
+    }
+
+    /** 运行期调整某个任务组整体的三项配额：作用于该 group 下所有 caller 的维度。 */
+    public void adjustGroupLimits(String group, QuotaLimits limits) {
+        if (group == null || group.isBlank()) {
+            throw new IllegalArgumentException("group must not be blank");
+        }
+        validateLimits(limits);
+        groupOverrides.put(group, limits);
+    }
+
+    private static void validateLimits(QuotaLimits limits) {
+        if (limits == null) {
+            throw new IllegalArgumentException("limits must not be null");
         }
         if (limits.maxConcurrency() < 0 || limits.rateLimitPerSecond() < 0
                 || limits.maxQueued() < 0) {
@@ -190,11 +237,56 @@ public class QuotaManager {
         }
     }
 
+    /** 暂停某个调用方整体派发：其下所有组的维度都不再启动新任务。 */
+    public void pauseCaller(String callerId) {
+        pausedCallers.add(callerId);
+    }
+
+    public void resumeCaller(String callerId) {
+        pausedCallers.remove(callerId);
+    }
+
+    public boolean isCallerPaused(String callerId) {
+        return pausedCallers.contains(callerId);
+    }
+
+    /** 暂停某个任务组整体派发：其下所有 caller 的维度都不再启动新任务。 */
+    public void pauseGroup(String group) {
+        pausedGroups.add(group);
+    }
+
+    public void resumeGroup(String group) {
+        pausedGroups.remove(group);
+    }
+
+    public boolean isGroupPaused(String group) {
+        return pausedGroups.contains(group);
+    }
+
+    /**
+     * 某运行维度当前是否暂停派发：精确维度、调用方整体、任务组整体
+     * 任一作用域处于暂停即视为暂停（暂停是叠加语义，互不低消）。
+     */
     public boolean isPaused(QuotaKey key) {
+        if (pausedCallers.contains(key.callerId()) || pausedGroups.contains(key.group())) {
+            return true;
+        }
         State s = state(key);
         synchronized (s) {
             return s.paused;
         }
+    }
+
+    /** 调用方整体作用域当前生效的配额（无覆盖时回落默认值，用于运行态展示）。 */
+    public QuotaLimits callerLimits(String callerId) {
+        QuotaLimits override = callerOverrides.get(callerId);
+        return override != null ? override : defaultLimits;
+    }
+
+    /** 任务组整体作用域当前生效的配额（无覆盖时回落默认值，用于运行态展示）。 */
+    public QuotaLimits groupLimits(String group) {
+        QuotaLimits override = groupOverrides.get(group);
+        return override != null ? override : defaultLimits;
     }
 
     /** 当前已知（有计量状态或有配额覆盖）的全部维度。 */
@@ -202,5 +294,19 @@ public class QuotaManager {
         java.util.Set<QuotaKey> keys = new java.util.LinkedHashSet<>(states.keySet());
         keys.addAll(overrides.keySet());
         return keys;
+    }
+
+    /** 当前已知有治理状态的调用方整体作用域（配额覆盖或暂停）。 */
+    public java.util.Set<String> knownCallerScopes() {
+        java.util.Set<String> callers = new java.util.LinkedHashSet<>(callerOverrides.keySet());
+        callers.addAll(pausedCallers);
+        return callers;
+    }
+
+    /** 当前已知有治理状态的任务组整体作用域（配额覆盖或暂停）。 */
+    public java.util.Set<String> knownGroupScopes() {
+        java.util.Set<String> groups = new java.util.LinkedHashSet<>(groupOverrides.keySet());
+        groups.addAll(pausedGroups);
+        return groups;
     }
 }

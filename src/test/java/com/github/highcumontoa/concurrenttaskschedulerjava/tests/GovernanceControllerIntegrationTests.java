@@ -98,4 +98,74 @@ class GovernanceControllerIntegrationTests {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[?(@.callerId=='erin')].group").value("g"));
     }
+
+    @Test
+    void scopedGovernanceOverHttp() throws Exception {
+        // 1) 只给调用方（不带任务组）：作用于该调用方整体
+        mvc.perform(put("/api/governance/quota")
+                        .contentType("application/json")
+                        .content("""
+                                {"callerId":"frank","maxConcurrency":2,"rateLimitPerSecond":0,"maxQueued":10}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.scope").value("CALLER"))
+                .andExpect(jsonPath("$.callerId").value("frank"))
+                .andExpect(jsonPath("$.maxConcurrency").value(2));
+
+        // 2) 只给任务组（不带调用方）：作用于该任务组整体
+        mvc.perform(put("/api/governance/quota")
+                        .contentType("application/json")
+                        .content("""
+                                {"group":"shared","maxConcurrency":1,"rateLimitPerSecond":0,"maxQueued":5}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.scope").value("GROUP"))
+                .andExpect(jsonPath("$.group").value("shared"))
+                .andExpect(jsonPath("$.maxConcurrency").value(1));
+
+        // 3) 调用方和任务组都没给：缺少作用域信息，400 且已生效值不变
+        mvc.perform(put("/api/governance/quota")
+                        .contentType("application/json")
+                        .content("""
+                                {"maxConcurrency":9,"rateLimitPerSecond":9,"maxQueued":9}
+                                """))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_REQUEST"));
+        mvc.perform(post("/api/governance/pause")
+                        .contentType("application/json")
+                        .content("{}"))
+                .andExpect(status().isBadRequest());
+
+        // 4) 调用方整体暂停/恢复 + 整体运行态查询
+        mvc.perform(post("/api/governance/pause")
+                        .contentType("application/json")
+                        .content("""
+                                {"callerId":"frank"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.scope").value("CALLER"))
+                .andExpect(jsonPath("$.paused").value(true));
+        mvc.perform(get("/api/governance/status").param("callerId", "frank"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.scope").value("CALLER"))
+                .andExpect(jsonPath("$.paused").value(true))
+                .andExpect(jsonPath("$.maxConcurrency").value(2));
+        mvc.perform(get("/api/governance/status").param("group", "shared"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.scope").value("GROUP"))
+                .andExpect(jsonPath("$.maxConcurrency").value(1));
+        mvc.perform(post("/api/governance/resume")
+                        .contentType("application/json")
+                        .content("""
+                                {"callerId":"frank"}
+                                """))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.paused").value(false));
+
+        // 5) 列表查询同时包含整体作用域与精确维度
+        mvc.perform(get("/api/governance/status"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[?(@.scope=='CALLER')].callerId").value("frank"))
+                .andExpect(jsonPath("$[?(@.scope=='GROUP')].group").value("shared"));
+    }
 }
