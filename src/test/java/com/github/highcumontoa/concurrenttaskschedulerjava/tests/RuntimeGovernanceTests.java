@@ -239,9 +239,11 @@ class RuntimeGovernanceTests {
             // 缺项非法
             assertThrows(IllegalArgumentException.class,
                     () -> kit.service.adjustQuota("alice", "g", null, 5, 50));
-            // 空调用方非法
+            // 缺少作用域信息（调用方与任务组都没给）非法
             assertThrows(IllegalArgumentException.class,
-                    () -> kit.service.adjustQuota(" ", "g", 1, 1, 1));
+                    () -> kit.service.adjustQuota(null, null, 1, 1, 1));
+            assertThrows(IllegalArgumentException.class,
+                    () -> kit.service.adjustQuota(" ", " ", 1, 1, 1));
 
             QuotaStatus st = kit.service.governanceStatus("alice", "g");
             assertEquals(2, st.maxConcurrency(), "非法调整后原并发上限必须保持不变");
@@ -324,9 +326,10 @@ class RuntimeGovernanceTests {
                 .handler(() -> gate)
                 .build();
         try {
-            // 暂停 + 运行期配额调整，然后提交两个任务（暂停期间照常排队）
+            // 暂停 + 运行期配额调整（并发收紧为 1，使恢复后的执行顺序可确定性断言），
+            // 然后提交两个任务（暂停期间照常排队）
             kit.service.pause("alice", "g");
-            kit.service.adjustQuota("alice", "g", 5, 0, 50);
+            kit.service.adjustQuota("alice", "g", 1, 0, 50);
             gate.gateFor("q1");
             gate.gateFor("q2");
             assertTrue(kit.service.submit("q1", "alice", "g", "gate", "p", null).accepted());
@@ -340,7 +343,7 @@ class RuntimeGovernanceTests {
             // 重启后：暂停状态与配额调整都必须保留，不能自动恢复放量
             QuotaStatus st = restarted.service.governanceStatus("alice", "g");
             assertTrue(st.paused(), "重启后暂停状态必须保留");
-            assertEquals(5, st.maxConcurrency(), "重启后运行期配额调整必须保留");
+            assertEquals(1, st.maxConcurrency(), "重启后运行期配额调整必须保留");
             assertEquals(0, st.rateLimitPerSecond());
             assertEquals(50, st.maxQueued());
             assertEquals(2, st.queued(), "重启后排队任务不丢失");
@@ -350,14 +353,16 @@ class RuntimeGovernanceTests {
             assertEquals(TaskStatus.QUEUED, restarted.service.get("q2").orElseThrow().getStatus());
             sleep(200);
             assertEquals(0, gate.totalStarts.get(), "暂停维度重启后不得自动恢复放量");
-            log.info("[治理] 重启后暂停与配额调整保持: paused=true 限额=5/0/50 queued=2");
+            log.info("[治理] 重启后暂停与配额调整保持: paused=true 限额=1/0/50 queued=2");
             assertCountsConsistent(restarted.service, "alice", "g");
 
-            // 恢复后排队任务继续执行
+            // 恢复后排队任务按原顺序继续执行（并发上限 1：q1 跑完才放行 q2，顺序确定）
             restarted.service.resume("alice", "g");
-            awaitStarts(gate, 2);
+            awaitStarts(gate, 1);
+            assertEquals(List.of("q1"), gate.startOrder, "恢复后必须先放行队头 q1");
             gate.openAll();
             awaitStatus(restarted.service, "q1", TaskStatus.SUCCEEDED);
+            awaitStarts(gate, 2);
             awaitStatus(restarted.service, "q2", TaskStatus.SUCCEEDED);
             assertEquals(List.of("q1", "q2"), gate.startOrder);
             assertCountsConsistent(restarted.service, "alice", "g");

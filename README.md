@@ -12,8 +12,10 @@
 - 提交幂等：相同 `taskId` 的重复提交（含高并发下的同时提交）只接受一次、只执行一次、只占一份配额。
 - 状态持久化到本地 WAL；进程重启后终态不回退、排队任务不丢失、执行中崩溃的任务重新排队、配额不泄漏。
 - 失败任务支持**指数退避重试**与终止策略；不可重试错误、取消、超时立即终止，绝不无限重试或重复执行。
-- **运行期治理**：无需重启即可按调用方/任务组调整三项配额、暂停/恢复派发，
-  并随时查询各维度运行态；治理状态持久化，重启后保持。
+- **运行期治理**：无需重启即可调整三项配额、暂停/恢复派发，作用域支持
+  **精确维度（caller+group）**、**调用方级（仅 caller，一次覆盖其全部任务组）**、
+  **任务组级（仅 group，一次覆盖其全部调用方）**三级，可查询各作用域运行态；
+  治理状态持久化，重启后保持。
 
 ## 2. 任务状态机
 
@@ -66,34 +68,73 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
 在不动原有提交、幂等、重试、取消与重启恢复语义的前提下，提供三个运行期治理能力，
 全部通过 HTTP 接口触发，**立即生效并持久化**（治理 WAL，见第 7 节）。
 
+### 4.0 治理作用域
+
+每个治理操作的作用域由 `callerId` / `group` 的给定组合决定：
+
+| 请求字段 | 作用域 | 作用范围 |
+| --- | --- | --- |
+| `callerId` + `group` 都给定 | 精确维度 | 只影响该 (caller, group) |
+| 只给 `callerId` | 调用方级 | 该调用方下**全部任务组**一次生效 |
+| 只给 `group` | 任务组级 | 该任务组下**全部调用方**一次生效 |
+| 都不给 | — | **非法**，HTTP 400 `INVALID_REQUEST`，原状态不变 |
+
+> 注意：治理接口中缺省 `group` 表示“该调用方全部任务组”，与提交接口的
+> “缺省 `group` 归入 `default` 组”不同；要治理 `default` 组需显式传 `"group":"default"`。
+
+多个作用域同时存在时，某维度 `(caller, group)` 的**生效配额**按优先级取第一个非空覆盖：
+
+```
+运行期精确(caller+group) > 运行期调用方级(caller) > 运行期任务组级(group)
+    > 静态配置(quotas.*) > 默认值
+```
+
+**暂停状态**取所有匹配作用域的并集：精确 / 调用方级 / 任务组级任一被暂停，
+该维度即暂停派发；恢复某个作用域只清除该作用域自身的暂停标记。
+
+三级作用域**互不串扰**：精确到某个调用方某个任务组的调整或暂停，
+不会改动同一调用方下其它组、也不会改动同一任务组下其它调用方的覆盖与暂停状态。
+调用方级/任务组级覆盖是为该层下**每个维度**设定生效限额（不是跨维度共享的合计池）。
+
 ### 4.1 配额热调整
 
-`PUT /api/governance/quota`，body：
+`PUT /api/governance/quota`，body（精确维度示例）：
 
 ```json
 {"callerId":"alice","group":"daily-report","maxConcurrency":4,"rateLimitPerSecond":0,"maxQueued":200}
 ```
 
-- 三项配额必须**全部给出且 >= 0**（0 表示不限，`group` 缺省为 `default`）；
-  改完立即参与后续调度判定。
+调用方级（对 alice 全部任务组生效）：`{"callerId":"alice","maxConcurrency":2,"rateLimitPerSecond":0,"maxQueued":100}`；
+任务组级（对 nightly 组全部调用方生效）：`{"group":"nightly","maxConcurrency":3,"rateLimitPerSecond":0,"maxQueued":60}`。
+
+- 三项配额必须**全部给出且 >= 0**（0 表示不限）；改完立即参与后续调度判定。
 - **调小并发上限**：已在执行的任务不被中断、状态不回退，只是不再按旧上限放行新任务；
   执行中任务自然结束后，占用降到新上限以下才会继续派发。
 - **调大上限**：积压的排队任务按原有队头阻塞 FIFO 顺序尽快放出。
-- **非法值**（缺项 / 任一项为负 / callerId 为空）：HTTP 400 `INVALID_REQUEST`，
+- **非法值**（缺项 / 任一项为负 / 缺少作用域信息）：HTTP 400 `INVALID_REQUEST`，
   原有生效值与已持久化的治理状态都保持不变。
 
 ### 4.2 暂停与恢复派发
 
-`POST /api/governance/pause` / `POST /api/governance/resume`，body：`{"callerId":"alice","group":"g"}`。
+`POST /api/governance/pause` / `POST /api/governance/resume`，body 同样按作用域组合：
+`{"callerId":"alice","group":"g"}`（精确）、`{"callerId":"alice"}`（调用方级）、
+`{"group":"g"}`（任务组级）。
 
-- 暂停期间：该维度**新提交照常受理并排队**（不拒绝、不丢失），执行中任务自然跑完，
-  只是不再启动新任务；排队上限等既有配额判定不受影响。
+- 暂停期间：该作用域覆盖的所有维度**新提交照常受理并排队**（不拒绝、不丢失），
+  执行中任务自然跑完，只是不再启动新任务；排队上限等既有配额判定不受影响。
 - 恢复后：排队任务按原公平顺序继续执行。
 - 暂停/恢复状态与配额调整一样**跨进程重启保留**，重启不会自动恢复放量。
 
 ### 4.3 运行态查询
 
-`GET /api/governance/status?callerId=alice&group=g` 查单个维度；不带参数列出全部已知维度。返回：
+`GET /api/governance/status`：
+
+- `?callerId=alice&group=g`：精确维度视图；
+- `?callerId=alice`：调用方级整体视图（`group` 为 null，计数为该调用方全部组合计）；
+- `?group=g`：任务组级整体视图（`callerId` 为 null，计数为该组全部调用方合计）；
+- 不带参数：列出全部已知维度与有治理状态的作用域。
+
+精确维度返回示例：
 
 ```json
 {
@@ -107,6 +148,9 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
 }
 ```
 
+调用方级 / 任务组级视图中，限额字段显示该作用域自身的运行期覆盖
+（无覆盖时为默认限额），计数为覆盖维度的合计。
+
 计数（`active` / `queued` / `startedInCurrentWindow`）与调度判定在同一临界区内读取：
 并发提交与并发调整同时进行时，视图与实际判定一致，
 已被拒绝或已结束的任务不会残留在排队统计里。
@@ -114,9 +158,11 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
 ### 4.4 与既有能力的兼容范围
 
 - 治理操作只影响**后续调度判定**；任务状态机、幂等键、重试退避、取消/超时语义完全不变。
-- 运行期配额覆盖持久化在治理 WAL 中，优先级高于 `application.properties` 的
-  `task.scheduler.quotas.*` 静态配置（重启后先应用静态配置，再回放治理 WAL）。
-- 治理 WAL 与任务 WAL 是**两个独立文件**，互不影响撕裂截断与回放逻辑。
+- 运行期配额覆盖（含调用方级/任务组级）持久化在治理 WAL 中，优先级高于
+  `application.properties` 的 `task.scheduler.quotas.*` 静态配置
+  （重启后先应用静态配置，再回放治理 WAL）。
+- 治理 WAL 与任务 WAL 是**两个独立文件**，互不影响撕裂截断与回放逻辑；
+  旧版治理 WAL（仅精确维度记录）可直接回放，记录格式向后兼容。
 
 ## 5. 提交 / 幂等约定
 
@@ -154,9 +200,9 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
   - `RUNNING`（崩溃时在执行）重新置为 `QUEUED` 再执行一次，绝不静默丢失；
   - 配额计数按恢复结果 `reinitialize`，防止配额泄漏/超发。
 - 崩溃导致最后一行写一半时，打开 WAL 会检测并**截断撕裂尾部**，此前完整记录不受影响。
-- 治理状态（运行期配额覆盖 + 暂停标记）持久化在独立的治理 WAL
+- 治理状态（运行期配额覆盖 + 暂停标记，含调用方级/任务组级作用域）持久化在独立的治理 WAL
   （默认 `data/task-scheduler.governance.wal`，可用 `governance-file` 调整）：
-  同样的 JSON Lines 追加 + 撕裂截断策略，重启后按维度回放最新一条，
+  同样的 JSON Lines 追加 + 撕裂截断策略，重启后按作用域回放最新一条，
   配额调整与暂停状态都不会因重启丢失。
 
 ## 8. HTTP 接口
@@ -167,10 +213,10 @@ CANCELLED(终态)       │ PENDING_RETRY ──退避中取消──▶ CANCELL
 | `GET /api/tasks/{taskId}` | 查询单个任务（404 `TASK_NOT_FOUND`） |
 | `GET /api/tasks` | 列出全部任务 |
 | `POST /api/tasks/{taskId}/cancel?reason=...` | 取消，返回 `{taskId, cancelled}` |
-| `PUT /api/governance/quota` | 运行期调整某维度三项配额（非法值 400 且原值不变） |
-| `POST /api/governance/pause` | 暂停某维度派发（新任务照常排队） |
-| `POST /api/governance/resume` | 恢复某维度派发 |
-| `GET /api/governance/status[?callerId&group]` | 查询单个或全部维度的运行态 |
+| `PUT /api/governance/quota` | 运行期调整三项配额，作用域由 callerId/group 组合决定（非法值 400 且原值不变） |
+| `POST /api/governance/pause` | 暂停某作用域派发（新任务照常排队） |
+| `POST /api/governance/resume` | 恢复某作用域派发 |
+| `GET /api/governance/status[?callerId][&group]` | 查询精确维度 / 调用方级 / 任务组级 / 全部运行态 |
 
 提交请求：
 
@@ -232,14 +278,15 @@ task.scheduler.quotas.bob:batch.max-queued=200
 环境：JDK 21+、Maven 3.9+。
 
 ```bash
-# 全量测试（32 个：并发配额、重复提交、取消/超时、重试、重启恢复、WAL 完整性、
-# 运行期治理、HTTP）
+# 全量测试（39 个：并发配额、重复提交、取消/超时、重试、重启恢复、WAL 完整性、
+# 运行期治理（精确/调用方级/任务组级作用域）、HTTP）
 mvn test
 
 # 单个套件
 mvn test -Dtest=ConcurrencyQuotaTests
 mvn test -Dtest=RestartRecoveryTests
 mvn test -Dtest=RuntimeGovernanceTests
+mvn test -Dtest=ScopedGovernanceTests
 
 # 启动服务后手工验证
 mvn spring-boot:run
@@ -257,6 +304,20 @@ curl -s 'localhost:8080/api/governance/status?callerId=alice&group=g'
 curl -s -XPOST localhost:8080/api/governance/resume -H 'Content-Type: application/json' -d '{
   "callerId":"alice","group":"g"}'
 curl -s localhost:8080/api/governance/status
+
+# 调用方级治理：不指定 group，一次作用于 alice 的全部任务组
+curl -s -XPUT localhost:8080/api/governance/quota -H 'Content-Type: application/json' -d '{
+  "callerId":"alice","maxConcurrency":2,"rateLimitPerSecond":0,"maxQueued":100}'
+curl -s -XPOST localhost:8080/api/governance/pause -H 'Content-Type: application/json' -d '{
+  "callerId":"alice"}'
+curl -s 'localhost:8080/api/governance/status?callerId=alice'
+curl -s -XPOST localhost:8080/api/governance/resume -H 'Content-Type: application/json' -d '{
+  "callerId":"alice"}'
+
+# 任务组级治理：不指定 callerId，一次作用于 nightly 组的全部调用方
+curl -s -XPUT localhost:8080/api/governance/quota -H 'Content-Type: application/json' -d '{
+  "group":"nightly","maxConcurrency":3,"rateLimitPerSecond":0,"maxQueued":60}'
+curl -s 'localhost:8080/api/governance/status?group=nightly'
 ```
 
 测试日志（单测控制台与 surefire 报告）按要求打印：
@@ -269,7 +330,8 @@ curl -s localhost:8080/api/governance/status
 ```
 config/      SchedulerProperties、Spring 装配（默认/覆盖配额、处理器注册、治理存储）
 model/       TaskRecord（WAL 快照）、TaskStatus、RejectReason、TaskException
-quota/       QuotaManager（并发槽位 + 固定窗口速率 + 排队计数 + 暂停标记）、QuotaStatus
+quota/       QuotaManager（并发槽位 + 固定窗口速率 + 排队计数 + 作用域暂停标记）、
+             QuotaScope（精确/调用方级/任务组级三级作用域）、QuotaStatus
 governance/  GovernanceRecord、GovernanceStore（治理状态 JSON Lines WAL + 撕裂截断恢复）
 retry/       RetryPolicy、指数退避实现、错误分类、NonRetryableTaskException
 handler/     TaskHandler/TaskContext、注册表、内置 sample 处理器

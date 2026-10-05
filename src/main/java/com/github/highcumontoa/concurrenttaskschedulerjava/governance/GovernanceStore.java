@@ -2,7 +2,7 @@ package com.github.highcumontoa.concurrenttaskschedulerjava.governance;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.github.highcumontoa.concurrenttaskschedulerjava.quota.QuotaKey;
+import com.github.highcumontoa.concurrenttaskschedulerjava.quota.QuotaScope;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -35,7 +35,7 @@ public class GovernanceStore implements AutoCloseable {
     private final Path path;
     private final boolean fsyncEachWrite;
     private final ObjectMapper mapper;
-    private final Map<QuotaKey, GovernanceRecord> index = new LinkedHashMap<>();
+    private final Map<QuotaScope, GovernanceRecord> index = new LinkedHashMap<>();
     private FileOutputStream fos;
 
     public GovernanceStore(String filePath, boolean fsyncEachWrite) {
@@ -75,10 +75,10 @@ public class GovernanceStore implements AutoCloseable {
                         log.warn("治理 WAL 撕裂/损坏行，将从偏移 {} 截断: {}", lineStart,
                                 parseError.getMessage());
                     }
-                    if (record == null || record.getCallerId() == null) {
+                    if (record == null || !hasScope(record)) {
                         break;
                     }
-                    index.put(keyOf(record), record);
+                    index.put(record.scope(), record);
                 }
                 validEnd = i < bytes.length ? i + 1 : bytes.length;
                 lineStart = i + 1;
@@ -98,14 +98,18 @@ public class GovernanceStore implements AutoCloseable {
         log.info("治理 WAL 恢复完成: {} 个维度, 文件={}", index.size(), path);
     }
 
-    private static QuotaKey keyOf(GovernanceRecord r) {
-        return QuotaKey.of(r.getCallerId(), r.getGroup());
+    /** 作用域信息校验：callerId / group 至少一个非空（允许其中一个为 null 表示整层作用域）。 */
+    private static boolean hasScope(GovernanceRecord r) {
+        boolean hasCaller = r.getCallerId() != null && !r.getCallerId().isBlank();
+        boolean hasGroup = r.getGroup() != null && !r.getGroup().isBlank();
+        return hasCaller || hasGroup;
     }
 
     /** 追加一条治理状态快照（返回后即视为已落盘）。 */
     public synchronized void append(GovernanceRecord record) {
-        if (record.getCallerId() == null || record.getCallerId().isBlank()) {
-            throw new IllegalArgumentException("callerId must not be blank");
+        if (!hasScope(record)) {
+            throw new IllegalArgumentException(
+                    "governance record requires at least one of callerId/group");
         }
         try {
             fos.write(mapper.writeValueAsBytes(record));
@@ -116,9 +120,9 @@ public class GovernanceStore implements AutoCloseable {
             }
         } catch (IOException e) {
             throw new UncheckedIOException(
-                    "failed to append governance WAL for " + keyOf(record), e);
+                    "failed to append governance WAL for " + record.scope().describe(), e);
         }
-        index.put(keyOf(record), record);
+        index.put(record.scope(), record);
     }
 
     /** 全部维度的最新治理状态（按首次出现顺序）。 */
